@@ -1,81 +1,69 @@
 <?php
 /**
- * ParkMate - car park owner dashboard
+ * ParkMate - administrator dashboard
  */
 
 require_once dirname(__DIR__) . '/config/config.php';
 
-require_role('owner', 'admin');
-$ownerId = user_id();
+require_role('admin');
 
-$earnings = db()->prepare(
-    'SELECT * FROM vw_owner_earnings WHERE owner_id = ? ORDER BY gross_revenue DESC'
-);
-$earnings->execute([$ownerId]);
-$lots = $earnings->fetchAll();
-
-$totals = db()->prepare(
+$counts = db()->query(
     'SELECT
-        COUNT(DISTINCT pl.lot_id)  AS lot_count,
-        COUNT(ps.slot_id)          AS slot_count,
-        COALESCE(SUM(ps.status = "maintenance"), 0) AS closed_count
-       FROM parking_lots pl
-  LEFT JOIN parking_slots ps ON ps.lot_id = pl.lot_id
-      WHERE pl.owner_id = ?'
-);
-$totals->execute([$ownerId]);
-$t = $totals->fetch();
+        (SELECT COUNT(*) FROM users WHERE role = "customer")            AS customers,
+        (SELECT COUNT(*) FROM users WHERE role = "owner")               AS owners,
+        (SELECT COUNT(*) FROM users WHERE status = "suspended")         AS suspended,
+        (SELECT COUNT(*) FROM parking_lots)                             AS lots,
+        (SELECT COUNT(*) FROM parking_lots WHERE status = "active")     AS active_lots,
+        (SELECT COUNT(*) FROM parking_slots)                            AS slots,
+        (SELECT COUNT(*) FROM reservations)                             AS bookings,
+        (SELECT COUNT(*) FROM reservations WHERE status = "cancelled")  AS cancelled,
+        (SELECT COUNT(*) FROM vehicles)                                 AS vehicles'
+)->fetch();
 
-$revenue = db()->prepare(
+$money = db()->query(
     'SELECT
-        COALESCE(SUM(CASE WHEN p.status = "paid" THEN r.total_amount END), 0) AS gross,
-        COALESCE(SUM(CASE WHEN p.status = "paid"
-                           AND MONTH(r.start_time) = MONTH(CURDATE())
-                           AND YEAR(r.start_time)  = YEAR(CURDATE())
-                          THEN r.total_amount END), 0) AS this_month,
-        COUNT(r.reservation_id) AS bookings,
-        COALESCE(SUM(r.status IN ("pending","confirmed") AND r.end_time >= NOW()), 0) AS upcoming
-       FROM parking_lots pl
-       JOIN parking_slots ps ON ps.lot_id = pl.lot_id
-  LEFT JOIN reservations  r  ON r.slot_id = ps.slot_id
-  LEFT JOIN payments      p  ON p.reservation_id = r.reservation_id
-      WHERE pl.owner_id = ?'
-);
-$revenue->execute([$ownerId]);
-$rev = $revenue->fetch();
+        COALESCE(SUM(CASE WHEN status = "paid" THEN amount END), 0)     AS collected,
+        COALESCE(SUM(CASE WHEN status = "pending" THEN amount END), 0)  AS outstanding,
+        COALESCE(SUM(CASE WHEN status = "refunded" THEN amount END), 0) AS refunded
+       FROM payments'
+)->fetch();
 
-// Bays occupied at this moment, across all this owner's car parks.
-$live = db()->prepare(
-    'SELECT COUNT(*) FROM reservations r
+// Commission ParkMate earns, using each owner's plan rate.
+$commission = db()->query(
+    'SELECT COALESCE(SUM(r.total_amount * sp.commission_rate / 100), 0) AS earned
+       FROM reservations r
+       JOIN payments      p  ON p.reservation_id = r.reservation_id AND p.status = "paid"
        JOIN parking_slots ps ON ps.slot_id = r.slot_id
        JOIN parking_lots  pl ON pl.lot_id  = ps.lot_id
-      WHERE pl.owner_id = ?
-        AND r.status IN ("confirmed","active")
-        AND NOW() BETWEEN r.start_time AND r.end_time'
-);
-$live->execute([$ownerId]);
-$occupiedNow = (int) $live->fetchColumn();
+       JOIN owner_subscriptions os ON os.owner_id = pl.owner_id AND os.status = "active"
+       JOIN subscription_plans  sp ON sp.plan_id  = os.plan_id'
+)->fetchColumn();
 
-$recent = db()->prepare(
-    'SELECT vrd.* FROM vw_reservation_details vrd
-      WHERE vrd.owner_id = ?
-   ORDER BY vrd.created_at DESC LIMIT 8'
-);
-$recent->execute([$ownerId]);
-$recentBookings = $recent->fetchAll();
+// Bookings per day over the last week, for the trend table.
+$trend = db()->query(
+    'SELECT DATE(created_at) AS day,
+            COUNT(*)         AS bookings,
+            COALESCE(SUM(total_amount), 0) AS value
+       FROM reservations
+      WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 6 DAY)
+   GROUP BY DATE(created_at)
+   ORDER BY day DESC'
+)->fetchAll();
 
-$plan = db()->prepare(
-    'SELECT sp.plan_name, sp.monthly_fee, sp.commission_rate, os.expires_on, os.status
-       FROM owner_subscriptions os
-       JOIN subscription_plans sp ON sp.plan_id = os.plan_id
-      WHERE os.owner_id = ? AND os.status = "active"
-   ORDER BY os.expires_on DESC LIMIT 1'
-);
-$plan->execute([$ownerId]);
-$subscription = $plan->fetch();
+$busiest = db()->query(
+    'SELECT * FROM vw_lot_availability
+      WHERE lot_status = "active"
+   ORDER BY (total_slots - free_slots) DESC, lot_name
+      LIMIT 5'
+)->fetchAll();
 
-$pageTitle = 'Owner dashboard';
-$navKey    = 'o-dash';
+$newest = db()->query(
+    'SELECT user_id, full_name, email, role, created_at
+       FROM users ORDER BY created_at DESC LIMIT 6'
+)->fetchAll();
+
+$pageTitle = 'Admin dashboard';
+$navKey    = 'a-dash';
 require dirname(__DIR__) . '/includes/header.php';
 ?>
 
@@ -84,69 +72,74 @@ require dirname(__DIR__) . '/includes/header.php';
 
         <div class="page-head">
             <div>
-                <h1>Dashboard</h1>
-                <p class="muted">How your car parks are doing today.</p>
+                <h1>Platform overview</h1>
+                <p class="muted">Everything happening across ParkMate.</p>
             </div>
-            <a class="btn btn--primary" href="<?= e(url('owner/lots.php')) ?>">Manage car parks</a>
+        </div>
+
+        <div class="grid grid--4" style="margin-bottom:18px">
+            <div class="stat stat--money">
+                <span class="stat__value" style="font-size:1.5rem"><?= e(money($money['collected'])) ?></span>
+                <span class="stat__label">collected from drivers</span>
+            </div>
+            <div class="stat stat--money">
+                <span class="stat__value" style="font-size:1.5rem"><?= e(money($commission)) ?></span>
+                <span class="stat__label">ParkMate commission earned</span>
+            </div>
+            <div class="stat">
+                <span class="stat__value" style="font-size:1.5rem"><?= e(money($money['outstanding'])) ?></span>
+                <span class="stat__label">held, awaiting payment</span>
+            </div>
+            <div class="stat stat--alert">
+                <span class="stat__value" style="font-size:1.5rem"><?= e(money($money['refunded'])) ?></span>
+                <span class="stat__label">refunded on cancellations</span>
+            </div>
         </div>
 
         <div class="grid grid--4" style="margin-bottom:30px">
-            <div class="stat stat--money">
-                <span class="stat__value" style="font-size:1.5rem"><?= e(money($rev['this_month'])) ?></span>
-                <span class="stat__label">taken this month</span>
+            <div class="stat stat--free">
+                <span class="stat__value"><?= (int) $counts['customers'] ?></span>
+                <span class="stat__label">drivers registered</span>
             </div>
             <div class="stat">
-                <span class="stat__value" style="font-size:1.5rem"><?= e(money($rev['gross'])) ?></span>
-                <span class="stat__label">taken all time</span>
+                <span class="stat__value"><?= (int) $counts['owners'] ?></span>
+                <span class="stat__label">car park operators</span>
             </div>
-            <div class="stat stat--free">
-                <span class="stat__value"><?= $occupiedNow ?> / <?= (int) $t['slot_count'] ?></span>
-                <span class="stat__label">bays occupied right now</span>
+            <div class="stat">
+                <span class="stat__value"><?= (int) $counts['active_lots'] ?> / <?= (int) $counts['lots'] ?></span>
+                <span class="stat__label">car parks listed</span>
             </div>
-            <div class="stat <?= (int) $t['closed_count'] > 0 ? 'stat--alert' : '' ?>">
-                <span class="stat__value"><?= (int) $t['closed_count'] ?></span>
-                <span class="stat__label">bays out of service</span>
+            <div class="stat">
+                <span class="stat__value"><?= (int) $counts['slots'] ?></span>
+                <span class="stat__label">bays on the platform</span>
             </div>
         </div>
 
         <div class="grid grid--sidebar">
             <section>
                 <div class="card__head">
-                    <h2>Your car parks</h2>
-                    <a class="small" href="<?= e(url('owner/lots.php')) ?>">Edit details</a>
+                    <h2>Bookings this week</h2>
+                    <span class="muted small"><?= (int) $counts['bookings'] ?> all time</span>
                 </div>
 
-                <?php if (!$lots): ?>
-                    <div class="empty">
-                        <h3>No car parks listed</h3>
-                        <p>Add your first one and start taking bookings.</p>
-                        <a class="btn btn--primary" href="<?= e(url('owner/lots.php')) ?>">Add a car park</a>
-                    </div>
+                <?php if (!$trend): ?>
+                    <div class="empty"><p>No bookings made in the last seven days.</p></div>
                 <?php else: ?>
                     <div class="table-wrap">
                         <table>
                             <thead>
                                 <tr>
-                                    <th>Car park</th>
+                                    <th>Day</th>
                                     <th class="num">Bookings</th>
-                                    <th class="num">Cancelled</th>
-                                    <th class="num">Revenue</th>
-                                    <th></th>
+                                    <th class="num">Value</th>
                                 </tr>
                             </thead>
                             <tbody>
-                                <?php foreach ($lots as $lot): ?>
+                                <?php foreach ($trend as $day): ?>
                                     <tr>
-                                        <td><strong><?= e($lot['lot_name']) ?></strong></td>
-                                        <td class="num"><?= (int) $lot['total_bookings'] ?></td>
-                                        <td class="num"><?= (int) $lot['cancelled_count'] ?></td>
-                                        <td class="num"><?= e(money($lot['gross_revenue'])) ?></td>
-                                        <td class="nowrap">
-                                            <a class="btn btn--small btn--ghost"
-                                               href="<?= e(url('owner/slots.php?lot_id=' . (int) $lot['lot_id'])) ?>">
-                                                Bays
-                                            </a>
-                                        </td>
+                                        <td><?= e(date('D, d M Y', strtotime($day['day']))) ?></td>
+                                        <td class="num"><?= (int) $day['bookings'] ?></td>
+                                        <td class="num"><?= e(money($day['value'])) ?></td>
                                     </tr>
                                 <?php endforeach; ?>
                             </tbody>
@@ -155,78 +148,70 @@ require dirname(__DIR__) . '/includes/header.php';
                 <?php endif; ?>
 
                 <div class="card__head" style="margin-top:30px">
-                    <h2>Latest bookings</h2>
-                    <a class="small" href="<?= e(url('owner/reservations.php')) ?>">See all</a>
+                    <h2>Busiest car parks</h2>
+                    <a class="small" href="<?= e(url('admin/lots.php')) ?>">All car parks</a>
                 </div>
 
-                <?php if (!$recentBookings): ?>
-                    <div class="empty"><p>No bookings have come in yet.</p></div>
-                <?php else: ?>
-                    <div class="table-wrap">
-                        <table>
-                            <thead>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Car park</th>
+                                <th>Operator</th>
+                                <th class="num">Bays</th>
+                                <th class="num">Free now</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($busiest as $lot): ?>
                                 <tr>
-                                    <th>Customer</th>
-                                    <th>Bay</th>
-                                    <th>Window</th>
-                                    <th class="num">Amount</th>
-                                    <th>Status</th>
+                                    <td>
+                                        <strong><?= e($lot['lot_name']) ?></strong><br>
+                                        <span class="muted small"><?= e($lot['city_name']) ?></span>
+                                    </td>
+                                    <td class="small"><?= e($lot['owner_name']) ?></td>
+                                    <td class="num"><?= (int) $lot['total_slots'] ?></td>
+                                    <td class="num"><?= (int) $lot['free_slots'] ?></td>
                                 </tr>
-                            </thead>
-                            <tbody>
-                                <?php foreach ($recentBookings as $b): ?>
-                                    <tr>
-                                        <td>
-                                            <?= e($b['customer_name']) ?><br>
-                                            <span class="muted small"><?= e($b['plate_number']) ?></span>
-                                        </td>
-                                        <td><span class="code"><?= e($b['slot_code']) ?></span></td>
-                                        <td class="small">
-                                            <?= e(dt($b['start_time'])) ?><br>
-                                            <span class="muted">to <?= e(dt($b['end_time'])) ?></span>
-                                        </td>
-                                        <td class="num"><?= e(money($b['total_amount'])) ?></td>
-                                        <td>
-                                            <span class="<?= e(status_class($b['reservation_status'])) ?>">
-                                                <?= e(ucfirst($b['reservation_status'])) ?>
-                                            </span>
-                                        </td>
-                                    </tr>
-                                <?php endforeach; ?>
-                            </tbody>
-                        </table>
-                    </div>
-                <?php endif; ?>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
             </section>
 
             <aside>
                 <div class="card">
-                    <h3>Your plan</h3>
-                    <?php if ($subscription): ?>
-                        <p style="margin-bottom:6px">
-                            <strong><?= e($subscription['plan_name']) ?></strong>
-                        </p>
-                        <p class="muted small" style="margin:0">
-                            <?= e(money($subscription['monthly_fee'])) ?> a month &middot;
-                            ParkMate keeps <?= e((string) $subscription['commission_rate']) ?>% of each booking.
-                        </p>
-                        <p class="muted small" style="margin:8px 0 0">
-                            Renews <?= e(date('d M Y', strtotime($subscription['expires_on']))) ?>.
-                        </p>
-                    <?php else: ?>
-                        <p class="muted small">
-                            No active plan. Contact ParkMate to list your car parks.
-                        </p>
-                    <?php endif; ?>
+                    <h3>Newest accounts</h3>
+                    <?php foreach ($newest as $person): ?>
+                        <div class="note">
+                            <h4><?= e($person['full_name']) ?></h4>
+                            <p><?= e($person['email']) ?></p>
+                            <p class="small" style="color:#8b939c">
+                                <?= e(ucfirst($person['role'])) ?> &middot;
+                                joined <?= e(date('d M Y', strtotime($person['created_at']))) ?>
+                            </p>
+                        </div>
+                    <?php endforeach; ?>
+                    <a class="btn btn--ghost btn--block" style="margin-top:12px"
+                       href="<?= e(url('admin/users.php')) ?>">Manage users</a>
                 </div>
 
+                <?php if ((int) $counts['suspended'] > 0): ?>
+                    <div class="notice notice--error" style="margin-top:16px">
+                        <?= (int) $counts['suspended'] ?>
+                        <?= (int) $counts['suspended'] === 1 ? 'account is' : 'accounts are' ?>
+                        suspended.
+                        <a href="<?= e(url('admin/users.php?role=all&status=suspended')) ?>">Review them</a>.
+                    </div>
+                <?php endif; ?>
+
                 <div class="card" style="margin-top:16px">
-                    <h3>At a glance</h3>
+                    <h3>Other numbers</h3>
                     <dl style="display:grid;grid-template-columns:1fr auto;gap:7px 12px;margin:0;font-size:.9rem">
-                        <dt class="muted">Car parks</dt><dd style="margin:0;text-align:right"><?= (int) $t['lot_count'] ?></dd>
-                        <dt class="muted">Bays</dt><dd style="margin:0;text-align:right"><?= (int) $t['slot_count'] ?></dd>
-                        <dt class="muted">Bookings taken</dt><dd style="margin:0;text-align:right"><?= (int) $rev['bookings'] ?></dd>
-                        <dt class="muted">Still upcoming</dt><dd style="margin:0;text-align:right"><?= (int) $rev['upcoming'] ?></dd>
+                        <dt class="muted">Vehicles registered</dt>
+                        <dd style="margin:0;text-align:right"><?= (int) $counts['vehicles'] ?></dd>
+                        <dt class="muted">Bookings cancelled</dt>
+                        <dd style="margin:0;text-align:right"><?= (int) $counts['cancelled'] ?></dd>
                     </dl>
                 </div>
             </aside>
